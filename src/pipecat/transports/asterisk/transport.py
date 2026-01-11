@@ -1,13 +1,23 @@
 import asyncio
 import socket
+import struct
+import time
 from typing import Awaitable, Callable, Optional
 
 from pydantic import BaseModel
-from pipecat.frames.frames import CancelFrame, EndFrame, InputAudioRawFrame, StartFrame
+from pipecat.frames.frames import CancelFrame, EndFrame, Frame, InputAudioRawFrame, InterruptionFrame, OutputAudioRawFrame, OutputTransportMessageFrame, OutputTransportMessageUrgentFrame, StartFrame
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+
+class HeaderType:
+    MSG_UUID = 0x01
+    MSG_AUDIO = 0x10
+    MSG_HANGUP = 0x00
+    MSG_DTMF = 0x03
+    MSG_ERROR = 0xff
 
 class AsteriskTransportParams(TransportParams):
 
@@ -22,12 +32,16 @@ class AsteriskTransportCallbacks(BaseModel):
     on_websocket_ready: Callable[[], Awaitable[None]]
 
 class AsteriskInputTransport(BaseInputTransport):
-    def __init__(self, transport: BaseTransport, host: asyncio.StreamReader, port: asyncio.StreamWriter, params: AsteriskTransportParams, callbacks: AsteriskTransportCallbacks):
+    def __init__(self, transport: BaseTransport, host: str, port: int, params: AsteriskTransportParams, callbacks: AsteriskTransportCallbacks, name: Optional[str] = None):
+        # FIXED: Added name parameter and proper super().__init__() call
+        super().__init__(params, name=name)
         self._transport = transport
-        self._host = host
-        self._port = port
+        self._host = host  
+        self._port = port  
         self._params = params
         self._callbacks = callbacks
+
+        self._client_writer: asyncio.StreamWriter | None = None
 
         self._server_task = None
 
@@ -89,40 +103,66 @@ class AsteriskInputTransport(BaseInputTransport):
 
     async def _server_task_handler(self):
         """Handle WebSocket server startup and client connections."""
-        print(f"Starting websocket server on {self._host}:{self._port}")
-        async with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((self._host, self._port))
-            s.listen()
-        async with websocket_serve(self._client_handler, self._host, self._port) as server:
-            await self._callbacks.on_websocket_ready()
+        # FIXED: Use stored host and port instead of reader/writer
+        print(f"Starting server on {self._host}:{self._port}")
+        server = await asyncio.start_server(
+            self._client_handler, 
+            host=self._host,
+            port=self._port
+        )
+        await self._callbacks.on_websocket_ready()
+        async with server:
             await self._stop_server_event.wait()
 
-    async def _client_handler(self, websocket: websockets.WebSocketServerProtocol):
+    async def _client_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle individual client connections and message processing."""
-        logger.info(f"New client connection from {websocket.remote_address}")
-        if self._websocket:
-            await self._websocket.close()
-            logger.warning("Only one client connected, using new connection")
+        peer = writer.get_extra_info("peername")
+        print(f"New client connection from {peer}")
+        if self._client_writer:
+            self._client_writer.close()
+            await self._client_writer.wait_closed()
+            print("Only one client connected, using new connection")
 
-        self._websocket = websocket
+        self._client_writer = writer
 
-        # Notify
-        await self._callbacks.on_client_connected(websocket)
+        await self._callbacks.on_client_connected(str(peer))
 
-        # Create a task to monitor the websocket connection
         if not self._monitor_task and self._params.session_timeout:
             self._monitor_task = self.create_task(
-                self._monitor_websocket(websocket, self._params.session_timeout)
+                self._monitor_websocket(self._params.session_timeout)
             )
 
-        # Handle incoming messages
         try:
-            async for message in websocket:
+            while True:
+                header = await reader.readexactly(3)
+                msg_type = header[0]
+                length = struct.unpack(">H", header[1:])[0]
+                payload = await reader.readexactly(length)
+        
                 if not self._params.serializer:
                     continue
 
-                frame = await self._params.serializer.deserialize(message)
+                # FIXED: Initialize frame variable
+                frame = None
+
+                if msg_type == HeaderType.MSG_AUDIO:
+                    frame = await self._params.serializer.deserialize(payload)
+
+                elif msg_type == HeaderType.MSG_HANGUP:
+                    # FIXED: Pass correct argument (peer string, not writer)
+                    await self._callbacks.on_client_disconnected(str(peer))
+                    break
+
+                # elif msg_type == HeaderType.MSG_DTMF:
+                #     frame = await self._params.serializer.deserialize(payload)
+
+                elif msg_type == HeaderType.MSG_ERROR:
+                    print(f"Received error message from client {peer}")
+                    break
+
+                else:
+                    print(f"Unknown message type: {msg_type}")
+                    continue
 
                 if not frame:
                     continue
@@ -131,31 +171,188 @@ class AsteriskInputTransport(BaseInputTransport):
                     await self.push_audio_frame(frame)
                 else:
                     await self.push_frame(frame)
+
         except Exception as e:
-            logger.error(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
+            print(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
 
         # Notify disconnection
-        await self._callbacks.on_client_disconnected(websocket)
+        # FIXED: Pass peer string, not writer
+        await self._callbacks.on_client_disconnected(str(peer))
 
-        await self._websocket.close()
-        self._websocket = None
+        # FIXED: Use writer variable, not self._client_writer
+        writer.close()
+        await writer.wait_closed()
+        self._client_writer = None
 
-        logger.info(f"Client {websocket.remote_address} disconnected")
+        print(f"Client {peer} disconnected")
 
     async def _monitor_websocket(
-        self, websocket: websockets.WebSocketServerProtocol, session_timeout: int
+        self, session_timeout: int
     ):
         """Monitor WebSocket connection for session timeout."""
         try:
             await asyncio.sleep(session_timeout)
-            if websocket.state is not State.CLOSED:
-                await self._callbacks.on_session_timeout(websocket)
+            if not self._client_writer:
+                await self._callbacks.on_session_timeout("session-timeout")
         except asyncio.CancelledError:
-            logger.info(f"Monitoring task cancelled for: {websocket.remote_address}")
+            print(f"Monitoring task cancelled for: {self._client_writer}")
             raise
 
 class AsteriskOutputTransport(BaseOutputTransport):
-    pass
+    def __init__(self, transport: BaseTransport, params: AsteriskTransportParams, name: Optional[str] = None, **kwargs):
+        """Initialize the WebSocket server output transport.
+
+        Args:
+            transport: The parent transport instance.
+            params: WebSocket server configuration parameters.
+            name: Optional name for the output processor.
+            **kwargs: Additional arguments passed to parent class.
+        """
+        # FIXED: Pass name parameter to super().__init__()
+        super().__init__(params, name=name, **kwargs)
+
+        self._transport = transport
+        self._params = params
+
+        self._client_writer: asyncio.StreamWriter | None = None
+
+        # write_audio_frame() is called quickly, as soon as we get audio
+        # (e.g. from the TTS), and since this is just a network connection we
+        # would be sending it to quickly. Instead, we want to block to emulate
+        # an audio device, this is what the send interval is. It will be
+        # computed on StartFrame.
+        self._send_interval = 0
+        self._next_send_time = 0
+
+        # Whether we have seen a StartFrame already.
+        self._initialized = False
+
+    async def set_client_connection(self, writer: asyncio.StreamWriter | None):
+        """Set the active client WebSocket connection.
+
+        Args:
+            writer: The StreamWriter connection to set as active, or None to clear.
+        """
+        if self._client_writer:
+            self._client_writer.close()
+            await self._client_writer.wait_closed()
+            print("Only one client allowed, using new connection")
+        self._client_writer = writer
+
+    async def start(self, frame: StartFrame):
+        """Start the output transport and initialize components.
+
+        Args:
+            frame: The start frame containing initialization parameters.
+        """
+        await super().start(frame)
+
+        if self._initialized:
+            return
+
+        self._initialized = True
+
+        if self._params.serializer:
+            await self._params.serializer.setup(frame)
+        self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
+        await self.set_transport_ready(frame)
+
+    async def stop(self, frame: EndFrame):
+        """Stop the output transport and send final frame.
+
+        Args:
+            frame: The end frame signaling transport shutdown.
+        """
+        await super().stop(frame)
+        await self._write_frame(frame)
+
+    async def cancel(self, frame: CancelFrame):
+        """Cancel the output transport and send cancellation frame.
+
+        Args:
+            frame: The cancel frame signaling immediate cancellation.
+        """
+        await super().cancel(frame)
+        await self._write_frame(frame)
+
+    async def cleanup(self):
+        """Cleanup resources and parent transport."""
+        await super().cleanup()
+        await self._transport.cleanup()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process frames and handle interruption timing.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction of frame flow in the pipeline.
+        """
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, InterruptionFrame):
+            await self._write_frame(frame)
+            self._next_send_time = 0
+
+    async def send_message(
+        self, frame: OutputTransportMessageFrame | OutputTransportMessageUrgentFrame
+    ):
+        """Send a transport message frame to the client.
+
+        Args:
+            frame: The transport message frame to send.
+        """
+        await self._write_frame(frame)
+
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        """Write an audio frame to the WebSocket client with timing control.
+
+        Args:
+            frame: The output audio frame to write.
+
+        Returns:
+            True if the audio frame was written successfully, False otherwise.
+        """
+        if not self._client_writer:
+            return False
+
+        frame = OutputAudioRawFrame(
+            audio=frame.audio,
+            sample_rate=self.sample_rate,
+            num_channels=self._params.audio_out_channels,
+        )
+
+        await self._write_frame(frame)
+
+        # Simulate audio playback with a sleep.
+        await self._write_audio_sleep()
+
+        return True
+    
+    async def _write_frame(self, frame: Frame):
+        """Serialize and send a frame to the WebSocket client."""
+        if not self._params.serializer:
+            return
+
+        try:
+            payload = await self._params.serializer.serialize(frame)
+            if payload and self._client_writer:
+                header = struct.pack("B", HeaderType.MSG_AUDIO) + struct.pack(">H", len(payload))
+                self._client_writer.write(header + payload)
+                await self._client_writer.drain()
+        except Exception as e:
+            print(f"{self} exception sending data: {e.__class__.__name__} ({e})")
+
+    async def _write_audio_sleep(self):
+        """Simulate audio device timing by sleeping between audio chunks."""
+        # Simulate a clock.
+        current_time = time.monotonic()
+        sleep_duration = max(0, self._next_send_time - current_time)
+        await asyncio.sleep(sleep_duration)
+        if sleep_duration == 0:
+            self._next_send_time = time.monotonic() + self._send_interval
+        else:
+            self._next_send_time += self._send_interval
+
 
 class AsteriskTransport(BaseTransport):
     def __init__(
@@ -188,6 +385,8 @@ class AsteriskTransport(BaseTransport):
         )
         self._input: Optional[AsteriskInputTransport] = None
         self._output: Optional[AsteriskOutputTransport] = None
+
+        self._client_writer: asyncio.StreamWriter | None = None
 
         # Register supported handlers. The user will only be able to register
         # these handlers.

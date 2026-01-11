@@ -31,15 +31,6 @@ class AsteriskSerializer(FrameSerializer):
 
         self._input_resampler = create_stream_resampler()
         self._output_resampler = create_stream_resampler()
-
-    @property
-    def type(self) -> FrameSerializerType:
-        """Get the serialization type supported by this serializer.
-
-        Returns:
-            The FrameSerializerType indicating binary or text format.
-        """
-        return FrameSerializerType.BINARY
     
     async def setup(self, frame: StartFrame):
         """Initialize the serializer with startup configuration.
