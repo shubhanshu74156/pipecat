@@ -358,7 +358,7 @@ class AsteriskTransport(BaseTransport):
     def __init__(
         self,
         params: AsteriskTransportParams,
-        host: str = "localhost",
+        host: str = "0.0.0.0",
         port: int = 8765,
         input_name: Optional[str] = None,
         output_name: Optional[str] = None,
@@ -367,7 +367,7 @@ class AsteriskTransport(BaseTransport):
 
         Args:
             params: WebSocket server configuration parameters.
-            host: Host address to bind the server to. Defaults to "localhost".
+            host: Host address to bind the server to. Defaults to "0.0.0.0".
             port: Port number to bind the server to. Defaults to 8765.
             input_name: Optional name for the input processor.
             output_name: Optional name for the output processor.
